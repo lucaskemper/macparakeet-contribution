@@ -13,7 +13,10 @@ MacParakeet validates the audio and keeps a copy in
 `AppPaths.appSupportDir/DictationSounds`; the original can be moved or deleted.
 Canceling or failing an import keeps the previous selection.
 
-Unavailable files fall back to the matching system cue and show a warning.
+Unavailable files or a selected cue that cannot start playback fall back once
+to the matching system cue and show a warning. If the system cue also fails,
+Settings reports that the sound could not be played. Playback never waits for
+a cue to finish before capture can continue.
 None and zero volume stay silent. Previews and capture cues respect the macOS
 sound-effects preference and system output volume. A capture cue stops any
 previous cue or preview. Previews are unavailable while a capture cue is playing.
@@ -38,3 +41,8 @@ swift test -Xswiftc -warn-concurrency \
 Manually check both presets and a custom file, independent volumes, None,
 reset, import cancellation/errors, and relaunch persistence. Check hold-to-talk,
 hands-free dictation, rapid start/stop, and the macOS sound-effects setting.
+
+Controller regressions cover failed selected/system playback, successful
+restoration in a fresh controller, and a delayed successful or failed restore
+finishing after a replacement import or reset. The restore races use a held
+read result rather than timing sleeps.

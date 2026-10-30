@@ -62,6 +62,7 @@ final class DictationSoundController {
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let library: DictationSoundLibrary
+    @ObservationIgnored private let loadCustomData: @MainActor (String) async throws -> Data
     @ObservationIgnored private let makePlayer: @MainActor (Data) throws -> any DictationCuePlaying
     @ObservationIgnored private let makeSystemPlayer: @MainActor (DictationSoundCue) -> (any DictationCuePlaying)?
     @ObservationIgnored private let soundEffectsEnabled: @MainActor () -> Bool
@@ -77,6 +78,7 @@ final class DictationSoundController {
     init(
         defaults: UserDefaults,
         library: DictationSoundLibrary,
+        loadCustomData: (@MainActor (String) async throws -> Data)? = nil,
         makePlayer: @escaping @MainActor (Data) throws -> any DictationCuePlaying = { try AudioDictationCue(data: $0) },
         makeSystemPlayer: @escaping @MainActor (DictationSoundCue) -> (any DictationCuePlaying)? = {
             SystemDictationCue(cue: $0)
@@ -92,6 +94,7 @@ final class DictationSoundController {
     ) {
         self.defaults = defaults
         self.library = library
+        self.loadCustomData = loadCustomData ?? { try await library.data(for: $0) }
         self.makePlayer = makePlayer
         self.makeSystemPlayer = makeSystemPlayer
         self.soundEffectsEnabled = soundEffectsEnabled
@@ -119,7 +122,7 @@ final class DictationSoundController {
             guard let fileName = configuration(for: cue).customFileName else { continue }
             let generation = generations[cue, default: 0]
             do {
-                let data = try await library.data(for: fileName)
+                let data = try await loadCustomData(fileName)
                 try Task.checkCancellation()
                 guard generation == generations[cue, default: 0],
                     configuration(for: cue).customFileName == fileName
@@ -202,9 +205,27 @@ final class DictationSoundController {
         activePlayer = nil
         let value = configuration(for: cue)
         guard soundEffectsEnabled(), value.style != .silent, value.volume > 0 else { return }
-        let player = selectedPlayer(for: cue) ?? systemPlayers[cue]
-        _ = player?.play(volume: Float(value.volume))
-        activePlayer = player
+        let selected = selectedPlayer(for: cue)
+        if let selected, selected.play(volume: Float(value.volume)) {
+            activePlayer = selected
+            updateWarning(for: cue)
+            return
+        }
+        selected?.stop()
+        // A prepared custom/preset player may still fail to start. Try the
+        // already-prepared system cue once, without retrying that same player.
+        if let fallback = systemPlayers[cue], selected !== fallback {
+            if fallback.play(volume: Float(value.volume)) {
+                activePlayer = fallback
+                updateWarning(for: cue)
+                if selected != nil {
+                    warnings[cue] = "This sound could not be played. Using \(cue.systemSoundName) instead."
+                }
+                return
+            }
+            fallback.stop()
+        }
+        warnings[cue] = "This sound could not be played. Choose another sound."
     }
 
     func preview(_ cue: DictationSoundCue) -> PreviewResult {

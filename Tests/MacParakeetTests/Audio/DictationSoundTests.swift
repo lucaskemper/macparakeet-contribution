@@ -220,6 +220,28 @@ private final class CueSpy: DictationCuePlaying {
 }
 
 @MainActor
+private final class PendingSoundRestore {
+    let started = XCTestExpectation(description: "Saved sound read started")
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var result: Result<Data, Error>?
+
+    func read() async throws -> Data {
+        if let result { return try result.get() }
+        return try await withCheckedThrowingContinuation {
+            continuation = $0
+            started.fulfill()
+        }
+    }
+
+    func complete(with result: Result<Data, Error>) {
+        self.result = result
+        let pending = continuation
+        continuation = nil
+        pending?.resume(with: result)
+    }
+}
+
+@MainActor
 private final class SoundHarness {
     let suite = "DictationSoundTests.\(UUID())"
     let defaults: UserDefaults
@@ -310,6 +332,77 @@ final class DictationSoundControllerTests: XCTestCase {
         h.controller.play(.start)
         XCTAssertEqual(h.systems[.start]?.plays.count, 1)
         XCTAssertNotNil(h.controller.warnings[.start])
+    }
+
+    @MainActor
+    func testFailedPresetUsesMatchingSystemFallbackAtConfiguredVolume() throws {
+        let h = try SoundHarness()
+        defer { h.cleanup() }
+        h.controller.setStyle(.handyMarimba, for: .stop)
+        h.controller.setVolume(0.7, for: .stop)
+        h.audioPlayers.forEach { $0.playSucceeds = false }
+
+        h.controller.play(.stop)
+
+        XCTAssertEqual(h.audioPlayers.flatMap(\.plays), [0.7])
+        XCTAssertTrue(h.audioPlayers.allSatisfy { !$0.isPlaying })
+        XCTAssertEqual(h.systems[.stop]?.plays, [0.7])
+        XCTAssertEqual(h.systems[.start]?.plays, [])
+        XCTAssertEqual(h.controller.warnings[.stop], "This sound could not be played. Using Pop instead.")
+        XCTAssertEqual(h.controller.preview(.start), .captureCuePlaying)
+    }
+
+    @MainActor
+    func testFailedCustomSoundUsesSystemFallback() async throws {
+        let h = try SoundHarness(includeAssets: false)
+        defer { h.cleanup() }
+        let source = h.root.appendingPathComponent("cue.wav")
+        try SoundFixture.wave().write(to: source)
+        try await h.controller.importSound(from: source, for: .start)
+        let custom = try XCTUnwrap(h.audioPlayers.last)
+        custom.playSucceeds = false
+
+        h.controller.play(.start)
+
+        XCTAssertEqual(custom.plays, [0.4])
+        XCTAssertEqual(custom.stops, 1)
+        XCTAssertEqual(h.systems[.start]?.plays, [0.4])
+        XCTAssertEqual(h.controller.configuration(for: .start).style, .custom)
+    }
+
+    @MainActor
+    func testFailedCueAndFallbackReportUnavailableAndClearWarningAfterRecovery() throws {
+        let h = try SoundHarness()
+        defer { h.cleanup() }
+        h.controller.setStyle(.handyPop, for: .start)
+        h.audioPlayers.forEach { $0.playSucceeds = false }
+        h.systems[.start]?.playSucceeds = false
+
+        h.controller.play(.start)
+
+        XCTAssertEqual(h.audioPlayers.flatMap(\.plays), [0.4])
+        XCTAssertEqual(h.systems[.start]?.plays, [0.4])
+        XCTAssertEqual(h.controller.warnings[.start], "This sound could not be played. Choose another sound.")
+        XCTAssertEqual(h.controller.preview(.stop), .played, "Failed playback must not own the capture player")
+
+        h.audioPlayers.forEach { $0.playSucceeds = true }
+        h.controller.play(.start)
+        XCTAssertNil(h.controller.warnings[.start])
+        XCTAssertEqual(h.systems[.start]?.plays, [0.4], "Successful selected playback must not use fallback")
+    }
+
+    @MainActor
+    func testFailedSystemCueIsNotRetriedAsItsOwnFallback() throws {
+        let h = try SoundHarness()
+        defer { h.cleanup() }
+        h.systems[.start]?.playSucceeds = false
+
+        h.controller.play(.start)
+
+        XCTAssertEqual(h.systems[.start]?.plays, [0.4])
+        XCTAssertEqual(h.systems[.start]?.stops, 1)
+        XCTAssertNotNil(h.controller.warnings[.start])
+        XCTAssertEqual(h.controller.preview(.stop), .played)
     }
 
     @MainActor
@@ -411,6 +504,126 @@ final class DictationSoundControllerTests: XCTestCase {
         XCTAssertNotNil(controller.warnings[.start])
         XCTAssertEqual(controller.configuration(for: .start).customFileName, saved.customFileName)
         XCTAssertEqual(h.systems[.start]?.plays.count, 1)
+    }
+
+    @MainActor
+    func testImportedSoundPlaysAfterFreshControllerRestoresOwnedCopy() async throws {
+        let h = try SoundHarness(includeAssets: false)
+        defer { h.cleanup() }
+        let source = h.root.appendingPathComponent("cue.wav")
+        let data = SoundFixture.wave()
+        try data.write(to: source)
+        try await h.controller.importSound(from: source, for: .start)
+        h.controller.setVolume(0.62, for: .start)
+        let saved = h.controller.configuration(for: .start)
+        try FileManager.default.removeItem(at: source)
+        let restored = CueSpy()
+        var loadedData: [Data] = []
+        let controller = DictationSoundController(
+            defaults: h.defaults, library: h.library,
+            makePlayer: { data in
+                loadedData.append(data); return restored
+            },
+            makeSystemPlayer: { h.systems[$0] }, resourceData: { _ in nil },
+            soundEffectsEnabled: { true }
+        )
+
+        await controller.prepareCustomSounds()
+        controller.play(.start)
+
+        XCTAssertEqual(controller.configuration(for: .start), saved)
+        XCTAssertEqual(loadedData, [data])
+        XCTAssertEqual(restored.plays, [0.62])
+        XCTAssertNil(controller.warnings[.start])
+        XCTAssertTrue(h.systems.values.allSatisfy { $0.plays.isEmpty })
+    }
+
+    @MainActor
+    func testLateRestoreCannotReplaceNewImportOrClearItOnFailure() async throws {
+        for fails in [false, true] {
+            let h = try SoundHarness(includeAssets: false)
+            defer { h.cleanup() }
+            let source = h.root.appendingPathComponent("cue.wav")
+            let oldData = SoundFixture.wave()
+            let newData = SoundFixture.wave(seconds: 0.2)
+            try oldData.write(to: source)
+            try await h.controller.importSound(from: source, for: .start)
+            let previous = try XCTUnwrap(h.controller.configuration(for: .start).customFileName)
+            let pending = PendingSoundRestore()
+            var loadedData: [Data] = []
+            let replacement = CueSpy()
+            let controller = DictationSoundController(
+                defaults: h.defaults, library: h.library,
+                loadCustomData: { name in
+                    XCTAssertEqual(name, previous)
+                    return try await pending.read()
+                },
+                makePlayer: { data in
+                    loadedData.append(data); return replacement
+                },
+                makeSystemPlayer: { h.systems[$0] }, resourceData: { _ in nil },
+                soundEffectsEnabled: { true }
+            )
+            let restore = Task { await controller.prepareCustomSounds() }
+            defer { pending.complete(with: .failure(CancellationError())); restore.cancel() }
+            await fulfillment(of: [pending.started], timeout: 2)
+            try newData.write(to: source)
+            try await controller.importSound(from: source, for: .start)
+            let current = try XCTUnwrap(controller.configuration(for: .start).customFileName)
+            pending.complete(with: fails ? .failure(DictationSoundLibrary.ImportError.invalidAudio) : .success(oldData))
+            await restore.value
+            controller.play(.start)
+
+            XCTAssertNotEqual(current, previous)
+            XCTAssertEqual(controller.configuration(for: .start).customFileName, current)
+            XCTAssertEqual(loadedData, [newData], "A stale successful read must not prepare the old player")
+            XCTAssertEqual(replacement.plays, [0.4], "A stale failure must not erase the new player")
+            XCTAssertNil(controller.warnings[.start])
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: h.root.appendingPathComponent("owned/\(previous)").path))
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: h.root.appendingPathComponent("owned/\(current)").path))
+        }
+    }
+
+    @MainActor
+    func testLateRestoreCannotUndoResetOrRestoreItsWarning() async throws {
+        for fails in [false, true] {
+            let h = try SoundHarness(includeAssets: false)
+            defer { h.cleanup() }
+            let source = h.root.appendingPathComponent("cue.wav")
+            let data = SoundFixture.wave()
+            try data.write(to: source)
+            try await h.controller.importSound(from: source, for: .start)
+            let previous = try XCTUnwrap(h.controller.configuration(for: .start).customFileName)
+            let pending = PendingSoundRestore()
+            var preparedPlayers = 0
+            let controller = DictationSoundController(
+                defaults: h.defaults, library: h.library,
+                loadCustomData: { _ in try await pending.read() },
+                makePlayer: { _ in
+                    preparedPlayers += 1; return CueSpy()
+                },
+                makeSystemPlayer: { h.systems[$0] }, resourceData: { _ in nil },
+                soundEffectsEnabled: { true }
+            )
+            let restore = Task { await controller.prepareCustomSounds() }
+            defer { pending.complete(with: .failure(CancellationError())); restore.cancel() }
+            await fulfillment(of: [pending.started], timeout: 2)
+            await controller.reset(.start)
+            pending.complete(with: fails ? .failure(DictationSoundLibrary.ImportError.invalidAudio) : .success(data))
+            await restore.value
+            controller.play(.start)
+
+            XCTAssertEqual(controller.configuration(for: .start), DictationSoundConfiguration())
+            XCTAssertEqual(
+                DictationSoundConfiguration.load(for: .start, defaults: h.defaults), DictationSoundConfiguration())
+            XCTAssertEqual(preparedPlayers, 0)
+            XCTAssertEqual(h.systems[.start]?.plays, [0.4])
+            XCTAssertNil(controller.warnings[.start])
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: h.root.appendingPathComponent("owned/\(previous)").path))
+        }
     }
 
     @MainActor
